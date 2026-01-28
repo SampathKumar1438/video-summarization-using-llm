@@ -1,0 +1,82 @@
+services:
+  # Frontend - React application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:4000/api/v1
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend/src:/app/src
+    networks:
+      - app-network
+
+  # Backend - Node.js/Express API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=development
+      - PORT=4000
+      - DATABASE_PATH=/app/storage/database.sqlite
+      - VIDEO_STORAGE_PATH=/app/storage/videos
+      - AUDIO_STORAGE_PATH=/app/storage/audio
+      - HIGHLIGHTS_STORAGE_PATH=/app/storage/highlights
+      - WHISPER_SERVICE_URL=http://processing:5000
+      - LLM_SERVICE_URL=http://llm:8080
+      - EMBEDDING_SERVICE_URL=http://processing:5001
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./backend/src:/app/src
+    depends_on:
+      - processing
+      - llm
+    networks:
+      - app-network
+
+  # Processing - Whisper Transcription + Embeddings (Python)
+  processing:
+    build:
+      context: ./processing
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    environment:
+      - WHISPER_MODEL=medium
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+    volumes:
+      - ./processing/models:/app/models
+      - ./backend/storage:/app/storage
+    networks:
+      - app-network
+
+  # LLM - Mistral 7B via llama.cpp
+  llm:
+    build:
+      context: ./llm
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - MODEL_PATH=/app/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf
+      - CONTEXT_SIZE=4096
+      - THREADS=4
+    volumes:
+      - ./llm/models:/app/models
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  storage:

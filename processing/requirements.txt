@@ -1,0 +1,14 @@
+flask>=2.3.0
+gunicorn>=21.0.0
+numpy>=1.24.0
+
+# CPU-only PyTorch (much smaller, ~200MB vs 2GB)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Whisper and dependencies
+openai-whisper>=20231117
+
+# Embeddings and vector search
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.4
