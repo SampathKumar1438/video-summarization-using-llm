@@ -3,10 +3,7 @@ import { searchSemantic } from '../services/embeddingService.js';
 
 /**
  * Keyword search across all videos or specific video
- */
-/**
- * Keyword search across all videos or specific video
- * Searches: Transcripts, Chapters, Summaries, Notes (Keywords)
+ * Uses PostgreSQL full-text search with to_tsvector
  */
 export async function keywordSearch(req, res) {
     try {
@@ -17,119 +14,164 @@ export async function keywordSearch(req, res) {
         }
 
         const db = getDatabase();
-        const searchTerm = `%${q}%`;
-        const params = [searchTerm, searchTerm, searchTerm, searchTerm, searchTerm];
+        const searchQuery = q.split(' ').join(' & '); // Convert to tsquery format
+        const limitNum = parseInt(limit);
 
-        // Base query conditions
-        let videoFilter = '';
+        let sql, params;
+
         if (videoId) {
-            videoFilter = 'AND t.video_id = ?'; // This needs to be adapted for each UNION
-            // We will inject the videoId parameter for each sub-query
+            sql = `
+                SELECT * FROM (
+                    -- Chapters
+                    SELECT 
+                        'chapter' as type,
+                        c.video_id,
+                        v.original_name as video_name,
+                        c.id as source_id,
+                        c.title || ': ' || COALESCE(c.summary, '') as text,
+                        c.start_time,
+                        c.end_time,
+                        1 as rank_priority,
+                        ts_rank(to_tsvector('english', c.title || ' ' || COALESCE(c.summary, '')), plainto_tsquery('english', $1)) as rank
+                    FROM chapters c
+                    JOIN videos v ON c.video_id = v.id
+                    WHERE to_tsvector('english', c.title || ' ' || COALESCE(c.summary, '')) @@ plainto_tsquery('english', $1)
+                    AND c.video_id = $2
+
+                    UNION ALL
+
+                    -- Summaries
+                    SELECT 
+                        'summary' as type,
+                        s.video_id,
+                        v.original_name as video_name,
+                        s.id as source_id,
+                        COALESCE(s.brief_summary, '') || ' ' || s.full_summary as text,
+                        0 as start_time,
+                        0 as end_time,
+                        2 as rank_priority,
+                        ts_rank(to_tsvector('english', COALESCE(s.brief_summary, '') || ' ' || s.full_summary), plainto_tsquery('english', $1)) as rank
+                    FROM summaries s
+                    JOIN videos v ON s.video_id = v.id
+                    WHERE to_tsvector('english', COALESCE(s.brief_summary, '') || ' ' || s.full_summary) @@ plainto_tsquery('english', $1)
+                    AND s.video_id = $2
+
+                    UNION ALL
+
+                    -- Notes
+                    SELECT 
+                        'note' as type,
+                        n.video_id,
+                        v.original_name as video_name,
+                        n.id as source_id,
+                        n.content as text,
+                        n.start_time,
+                        n.end_time,
+                        3 as rank_priority,
+                        ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $1)) as rank
+                    FROM notes n
+                    JOIN videos v ON n.video_id = v.id
+                    WHERE to_tsvector('english', n.content) @@ plainto_tsquery('english', $1)
+                    AND n.video_id = $2
+
+                    UNION ALL
+
+                    -- Transcripts
+                    SELECT 
+                        'transcript' as type,
+                        t.video_id,
+                        v.original_name as video_name,
+                        t.id as source_id,
+                        t.text,
+                        t.start_time,
+                        t.end_time,
+                        4 as rank_priority,
+                        ts_rank(to_tsvector('english', t.text), plainto_tsquery('english', $1)) as rank
+                    FROM transcripts t
+                    JOIN videos v ON t.video_id = v.id
+                    WHERE to_tsvector('english', t.text) @@ plainto_tsquery('english', $1)
+                    AND t.video_id = $2
+                ) combined_results
+                ORDER BY rank_priority ASC, rank DESC, start_time ASC
+                LIMIT $3
+            `;
+            params = [q, videoId, limitNum];
+        } else {
+            sql = `
+                SELECT * FROM (
+                    -- Chapters
+                    SELECT 
+                        'chapter' as type,
+                        c.video_id,
+                        v.original_name as video_name,
+                        c.id as source_id,
+                        c.title || ': ' || COALESCE(c.summary, '') as text,
+                        c.start_time,
+                        c.end_time,
+                        1 as rank_priority,
+                        ts_rank(to_tsvector('english', c.title || ' ' || COALESCE(c.summary, '')), plainto_tsquery('english', $1)) as rank
+                    FROM chapters c
+                    JOIN videos v ON c.video_id = v.id
+                    WHERE to_tsvector('english', c.title || ' ' || COALESCE(c.summary, '')) @@ plainto_tsquery('english', $1)
+
+                    UNION ALL
+
+                    -- Summaries
+                    SELECT 
+                        'summary' as type,
+                        s.video_id,
+                        v.original_name as video_name,
+                        s.id as source_id,
+                        COALESCE(s.brief_summary, '') || ' ' || s.full_summary as text,
+                        0 as start_time,
+                        0 as end_time,
+                        2 as rank_priority,
+                        ts_rank(to_tsvector('english', COALESCE(s.brief_summary, '') || ' ' || s.full_summary), plainto_tsquery('english', $1)) as rank
+                    FROM summaries s
+                    JOIN videos v ON s.video_id = v.id
+                    WHERE to_tsvector('english', COALESCE(s.brief_summary, '') || ' ' || s.full_summary) @@ plainto_tsquery('english', $1)
+
+                    UNION ALL
+
+                    -- Notes
+                    SELECT 
+                        'note' as type,
+                        n.video_id,
+                        v.original_name as video_name,
+                        n.id as source_id,
+                        n.content as text,
+                        n.start_time,
+                        n.end_time,
+                        3 as rank_priority,
+                        ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $1)) as rank
+                    FROM notes n
+                    JOIN videos v ON n.video_id = v.id
+                    WHERE to_tsvector('english', n.content) @@ plainto_tsquery('english', $1)
+
+                    UNION ALL
+
+                    -- Transcripts
+                    SELECT 
+                        'transcript' as type,
+                        t.video_id,
+                        v.original_name as video_name,
+                        t.id as source_id,
+                        t.text,
+                        t.start_time,
+                        t.end_time,
+                        4 as rank_priority,
+                        ts_rank(to_tsvector('english', t.text), plainto_tsquery('english', $1)) as rank
+                    FROM transcripts t
+                    JOIN videos v ON t.video_id = v.id
+                    WHERE to_tsvector('english', t.text) @@ plainto_tsquery('english', $1)
+                ) combined_results
+                ORDER BY rank_priority ASC, rank DESC, start_time ASC
+                LIMIT $2
+            `;
+            params = [q, limitNum];
         }
 
-        // We use UNION ALL to aggregate matches from different sources
-        // Rank priorities: 
-        // 1. Chapters (Title)
-        // 2. Summaries
-        // 3. Notes (Keywords/Key Points)
-        // 4. Transcripts (Raw text)
-
-        let query = `
-        SELECT * FROM (
-            -- 1. Chapters
-            SELECT 
-                'chapter' as type,
-                c.video_id,
-                v.original_name as video_name,
-                c.id as source_id,
-                c.title || ': ' || c.summary as text,
-                c.start_time,
-                c.end_time,
-                1 as rank_priority
-            FROM chapters c
-            JOIN videos v ON c.video_id = v.id
-            WHERE (c.title LIKE ? OR c.summary LIKE ?)
-            ${videoId ? 'AND c.video_id = ?' : ''}
-
-            UNION ALL
-
-            -- 2. Summaries
-            SELECT 
-                'summary' as type,
-                s.video_id,
-                v.original_name as video_name,
-                s.id as source_id,
-                s.brief_summary || '\n' || s.full_summary as text,
-                0 as start_time,
-                0 as end_time,
-                2 as rank_priority
-            FROM summaries s
-            JOIN videos v ON s.video_id = v.id
-            WHERE (s.full_summary LIKE ? OR s.brief_summary LIKE ?)
-            ${videoId ? 'AND s.video_id = ?' : ''}
-
-            UNION ALL
-
-            -- 3. Notes (includes Keywords)
-            SELECT 
-                'note' as type,
-                n.video_id,
-                v.original_name as video_name,
-                n.id as source_id,
-                n.content as text,
-                n.start_time,
-                n.end_time,
-                3 as rank_priority
-            FROM notes n
-            JOIN videos v ON n.video_id = v.id
-            WHERE n.content LIKE ?
-            ${videoId ? 'AND n.video_id = ?' : ''}
-
-            UNION ALL
-
-            -- 4. Transcripts
-            SELECT 
-                'transcript' as type,
-                t.video_id,
-                v.original_name as video_name,
-                t.id as source_id,
-                t.text,
-                t.start_time,
-                t.end_time,
-                4 as rank_priority
-            FROM transcripts t
-            JOIN videos v ON t.video_id = v.id
-            WHERE t.text LIKE ?
-            ${videoId ? 'AND t.video_id = ?' : ''}
-        ) combined_results
-        ORDER BY rank_priority ASC, start_time ASC
-        LIMIT ?
-        `;
-
-        // params construction is tricky with dynamic videoId injection
-        // Let's rebuild params cleanly
-        const finalParams = [];
-
-        // Chapters
-        finalParams.push(searchTerm, searchTerm);
-        if (videoId) finalParams.push(videoId);
-
-        // Summaries
-        finalParams.push(searchTerm, searchTerm);
-        if (videoId) finalParams.push(videoId);
-
-        // Notes
-        finalParams.push(searchTerm);
-        if (videoId) finalParams.push(videoId);
-
-        // Transcripts
-        finalParams.push(searchTerm);
-        if (videoId) finalParams.push(videoId);
-
-        // Limit
-        finalParams.push(parseInt(limit));
-
-        const results = db.prepare(query).all(...finalParams);
+        const results = await db.all(sql, params);
 
         res.json({
             success: true,
@@ -140,7 +182,7 @@ export async function keywordSearch(req, res) {
                     videoId: r.video_id,
                     videoName: r.video_name,
                     sourceId: r.source_id,
-                    text: r.text.length > 200 ? r.text.substring(0, 200) + '...' : r.text, // Truncate long text
+                    text: r.text.length > 200 ? r.text.substring(0, 200) + '...' : r.text,
                     startTime: r.start_time,
                     endTime: r.end_time,
                     rank: r.rank_priority
@@ -155,7 +197,7 @@ export async function keywordSearch(req, res) {
 }
 
 /**
- * Semantic search across all videos or specific video
+ * Semantic search using pgvector
  */
 export async function semanticSearch(req, res) {
     try {
@@ -165,7 +207,7 @@ export async function semanticSearch(req, res) {
             return res.status(400).json({ success: false, error: 'Query parameter "q" is required' });
         }
 
-        // Get semantic search results from embedding service
+        // Get semantic search results from pgvector
         const searchResults = await searchSemantic(q, videoId || null, parseInt(limit));
 
         if (!searchResults || searchResults.length === 0) {
@@ -182,20 +224,20 @@ export async function semanticSearch(req, res) {
         // Get transcript details for the results
         const db = getDatabase();
         const transcriptIds = searchResults.map(r => r.transcript_id);
-        const placeholders = transcriptIds.map(() => '?').join(',');
+        const placeholders = transcriptIds.map((_, i) => `$${i + 1}`).join(',');
 
-        const transcripts = db.prepare(`
-      SELECT 
-        t.id,
-        t.video_id,
-        v.original_name as video_name,
-        t.start_time,
-        t.end_time,
-        t.text
-      FROM transcripts t
-      JOIN videos v ON t.video_id = v.id
-      WHERE t.id IN (${placeholders})
-    `).all(...transcriptIds);
+        const transcripts = await db.all(`
+            SELECT 
+                t.id,
+                t.video_id,
+                v.original_name as video_name,
+                t.start_time,
+                t.end_time,
+                t.text
+            FROM transcripts t
+            JOIN videos v ON t.video_id = v.id
+            WHERE t.id IN (${placeholders})
+        `, transcriptIds);
 
         // Create a map for easy lookup
         const transcriptMap = new Map(transcripts.map(t => [t.id, t]));

@@ -45,7 +45,7 @@ export function extractAudio(videoPath, videoId) {
                 }
             })
             .on('error', (err) => {
-                console.error('FFmpeg error:', err.message);
+                console.error('FFmpeg audio extraction error:', err.message);
                 reject(err);
             })
             .on('end', () => {
@@ -74,9 +74,9 @@ export function getVideoDuration(videoPath) {
 }
 
 /**
- * Create highlight video by cutting and merging clips
+ * Create highlight video by cutting and merging clips with proper audio/video sync
  * @param {string} videoPath - Path to source video
- * @param {Array<{start_time: number, end_time: number}>} clips - Array of clip timestamps
+ * @param {Array<{start_time: number, end_time: number, category?: string, reason?: string}>} clips - Array of clip timestamps
  * @param {string} outputId - Output file identifier
  * @returns {Promise<string>} Path to the highlight video
  */
@@ -101,14 +101,20 @@ export function createHighlightVideo(videoPath, clips, outputId) {
         }
 
         try {
-            // Extract each clip
+            console.log(`Creating highlight video with ${clips.length} clips...`);
+
+            // Sort clips by start time
+            const sortedClips = [...clips].sort((a, b) => a.start_time - b.start_time);
+
+            // Extract each clip with improved settings
             const clipPaths = [];
-            for (let i = 0; i < clips.length; i++) {
-                const clip = clips[i];
+            for (let i = 0; i < sortedClips.length; i++) {
+                const clip = sortedClips[i];
                 const clipPath = path.join(tempDir, `clip_${i}.mp4`);
                 clipPaths.push(clipPath);
 
-                await extractClip(videoPath, clip.start_time, clip.end_time, clipPath);
+                console.log(`Extracting clip ${i + 1}/${sortedClips.length}: ${clip.start_time}s - ${clip.end_time}s (${clip.category || 'general'})`);
+                await extractClipEnhanced(videoPath, clip.start_time, clip.end_time, clipPath, i === 0, i === sortedClips.length - 1);
             }
 
             // Create concat file
@@ -116,8 +122,8 @@ export function createHighlightVideo(videoPath, clips, outputId) {
             const concatContent = clipPaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n');
             fs.writeFileSync(concatFilePath, concatContent);
 
-            // Merge clips
-            await mergeClips(concatFilePath, outputPath);
+            // Merge clips with re-encoding for smooth transitions
+            await mergeClipsWithTransitions(concatFilePath, outputPath);
 
             // Cleanup temp files
             for (const clipPath of clipPaths) {
@@ -126,8 +132,10 @@ export function createHighlightVideo(videoPath, clips, outputId) {
             if (fs.existsSync(concatFilePath)) fs.unlinkSync(concatFilePath);
             if (fs.existsSync(tempDir)) fs.rmdirSync(tempDir);
 
+            console.log(`Highlight video created: ${outputPath}`);
             resolve(outputPath);
         } catch (error) {
+            console.error('Highlight video creation error:', error);
             // Cleanup on error
             if (fs.existsSync(tempDir)) {
                 fs.rmSync(tempDir, { recursive: true, force: true });
@@ -138,38 +146,105 @@ export function createHighlightVideo(videoPath, clips, outputId) {
 }
 
 /**
- * Extract a single clip from video
+ * Extract a single clip with enhanced quality and fade effects
+ * @param {string} videoPath - Source video path
+ * @param {number} startTime - Start time in seconds
+ * @param {number} endTime - End time in seconds
+ * @param {string} outputPath - Output clip path
+ * @param {boolean} isFirst - Is this the first clip
+ * @param {boolean} isLast - Is this the last clip
  */
-function extractClip(videoPath, startTime, endTime, outputPath) {
+function extractClipEnhanced(videoPath, startTime, endTime, outputPath, isFirst, isLast) {
     return new Promise((resolve, reject) => {
         const duration = endTime - startTime;
+        const fadeDuration = 0.3; // 300ms fade
 
-        ffmpeg(videoPath)
-            .setStartTime(startTime)
-            .setDuration(duration)
+        // Build filter complex for fades
+        let videoFilters = [];
+        let audioFilters = [];
+
+        // Add fade in at the beginning of each clip
+        videoFilters.push(`fade=t=in:st=0:d=${fadeDuration}`);
+        audioFilters.push(`afade=t=in:st=0:d=${fadeDuration}`);
+
+        // Add fade out at the end of each clip
+        const fadeOutStart = Math.max(0, duration - fadeDuration);
+        videoFilters.push(`fade=t=out:st=${fadeOutStart}:d=${fadeDuration}`);
+        audioFilters.push(`afade=t=out:st=${fadeOutStart}:d=${fadeDuration}`);
+
+        // Use -ss before -i for accurate seeking (fast seek to keyframe, then precise seek)
+        ffmpeg()
+            .input(videoPath)
+            .inputOptions([`-ss ${startTime}`])  // Seek before input for accuracy
             .outputOptions([
-                '-c:v', 'libx264',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
+                `-t ${duration}`,                // Duration
+                '-c:v', 'libx264',              // H.264 video codec
+                '-preset', 'fast',              // Encoding speed/quality tradeoff
+                '-crf', '23',                   // Constant Rate Factor (18-28, lower = better)
+                '-pix_fmt', 'yuv420p',          // Pixel format for compatibility
+                '-c:a', 'aac',                  // AAC audio codec
+                '-b:a', '128k',                 // Audio bitrate
+                '-ar', '44100',                 // Audio sample rate
+                '-ac', '2',                     // Stereo audio
+                '-vf', videoFilters.join(','),  // Video filters (fades)
+                '-af', audioFilters.join(','),  // Audio filters (fades)
+                '-movflags', '+faststart',      // Optimize for web playback
                 '-avoid_negative_ts', 'make_zero'
             ])
-            .on('error', reject)
-            .on('end', resolve)
+            .on('start', (cmd) => {
+                console.log('FFmpeg command:', cmd.substring(0, 200) + '...');
+            })
+            .on('progress', (progress) => {
+                if (progress.percent) {
+                    process.stdout.write(`\rClip progress: ${progress.percent.toFixed(1)}%`);
+                }
+            })
+            .on('error', (err, stdout, stderr) => {
+                console.error('FFmpeg clip extraction error:', err.message);
+                console.error('stderr:', stderr);
+                reject(err);
+            })
+            .on('end', () => {
+                console.log(''); // New line after progress
+                resolve();
+            })
             .save(outputPath);
     });
 }
 
 /**
- * Merge clips using concat demuxer
+ * Merge clips with smooth transitions using concat demuxer
  */
-function mergeClips(concatFilePath, outputPath) {
+function mergeClipsWithTransitions(concatFilePath, outputPath) {
     return new Promise((resolve, reject) => {
+        // Since clips already have fades, we can use copy mode for faster processing
+        // But re-encoding ensures consistent format
         ffmpeg()
             .input(concatFilePath)
             .inputOptions(['-f', 'concat', '-safe', '0'])
-            .outputOptions(['-c', 'copy'])
-            .on('error', reject)
-            .on('end', resolve)
+            .outputOptions([
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-ar', '44100',
+                '-movflags', '+faststart'
+            ])
+            .on('progress', (progress) => {
+                if (progress.percent) {
+                    process.stdout.write(`\rMerge progress: ${progress.percent.toFixed(1)}%`);
+                }
+            })
+            .on('error', (err, stdout, stderr) => {
+                console.error('FFmpeg merge error:', err.message);
+                reject(err);
+            })
+            .on('end', () => {
+                console.log(''); // New line after progress
+                resolve();
+            })
             .save(outputPath);
     });
 }

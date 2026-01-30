@@ -5,28 +5,28 @@ import { createHighlightVideo } from '../services/ffmpegService.js';
 /**
  * Get highlight video info
  */
-export function getHighlights(req, res) {
+export async function getHighlights(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const highlight = db.prepare(`
-      SELECT h.*, v.file_path as video_path
-      FROM highlights h
-      JOIN videos v ON h.video_id = v.id
-      WHERE h.video_id = ?
-    `).get(id);
+        const highlight = await db.get(`
+            SELECT h.*, v.file_path as video_path
+            FROM highlights h
+            JOIN videos v ON h.video_id = v.id
+            WHERE h.video_id = $1
+        `, [id]);
 
         if (!highlight) {
             return res.status(404).json({ success: false, error: 'No highlights found for this video' });
         }
 
-        const clips = db.prepare(`
-      SELECT clip_index, start_time, end_time, reason
-      FROM highlight_clips
-      WHERE highlight_id = ?
-      ORDER BY clip_index
-    `).all(highlight.id);
+        const clips = await db.all(`
+            SELECT clip_index, start_time, end_time, category, reason, transcript_excerpt
+            FROM highlight_clips
+            WHERE highlight_id = $1
+            ORDER BY clip_index
+        `, [highlight.id]);
 
         res.json({
             success: true,
@@ -38,7 +38,9 @@ export function getHighlights(req, res) {
                     index: c.clip_index,
                     startTime: c.start_time,
                     endTime: c.end_time,
-                    reason: c.reason
+                    category: c.category,
+                    reason: c.reason,
+                    transcriptExcerpt: c.transcript_excerpt
                 })),
                 createdAt: highlight.created_at
             }
@@ -52,16 +54,16 @@ export function getHighlights(req, res) {
 /**
  * Stream highlight video
  */
-export function streamHighlight(req, res) {
+export async function streamHighlight(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const highlight = db.prepare(`
-      SELECT file_path, status
-      FROM highlights
-      WHERE video_id = ? AND status = 'completed'
-    `).get(id);
+        const highlight = await db.get(`
+            SELECT file_path, status
+            FROM highlights
+            WHERE video_id = $1 AND status = 'completed'
+        `, [id]);
 
         if (!highlight || !highlight.file_path || !fs.existsSync(highlight.file_path)) {
             return res.status(404).json({ success: false, error: 'Highlight video not found' });
@@ -107,29 +109,29 @@ export async function regenerateHighlight(req, res) {
         const { id } = req.params;
         const db = getDatabase();
 
-        const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT * FROM videos WHERE id = $1', [id]);
         if (!video) {
             return res.status(404).json({ success: false, error: 'Video not found' });
         }
 
-        const highlight = db.prepare('SELECT * FROM highlights WHERE video_id = ?').get(id);
+        const highlight = await db.get('SELECT * FROM highlights WHERE video_id = $1', [id]);
         if (!highlight) {
             return res.status(404).json({ success: false, error: 'No highlight data found' });
         }
 
-        const clips = db.prepare(`
-      SELECT start_time, end_time, reason
-      FROM highlight_clips
-      WHERE highlight_id = ?
-      ORDER BY clip_index
-    `).all(highlight.id);
+        const clips = await db.all(`
+            SELECT start_time, end_time, category, reason
+            FROM highlight_clips
+            WHERE highlight_id = $1
+            ORDER BY clip_index
+        `, [highlight.id]);
 
         if (clips.length === 0) {
             return res.status(400).json({ success: false, error: 'No highlight clips defined' });
         }
 
         // Update status
-        db.prepare('UPDATE highlights SET status = ? WHERE id = ?').run('generating', highlight.id);
+        await db.run("UPDATE highlights SET status = $1 WHERE id = $2", ['generating', highlight.id]);
 
         // Generate in background
         res.json({
@@ -143,11 +145,11 @@ export async function regenerateHighlight(req, res) {
         // Async generation
         try {
             const highlightPath = await createHighlightVideo(video.file_path, clips, id);
-            db.prepare('UPDATE highlights SET status = ?, file_path = ? WHERE id = ?')
-                .run('completed', highlightPath, highlight.id);
+            await db.run('UPDATE highlights SET status = $1, file_path = $2 WHERE id = $3',
+                ['completed', highlightPath, highlight.id]);
         } catch (error) {
             console.error('Highlight generation failed:', error);
-            db.prepare('UPDATE highlights SET status = ? WHERE id = ?').run('failed', highlight.id);
+            await db.run("UPDATE highlights SET status = $1 WHERE id = $2", ['failed', highlight.id]);
         }
     } catch (error) {
         console.error('Regenerate highlight error:', error);
@@ -158,16 +160,16 @@ export async function regenerateHighlight(req, res) {
 /**
  * Get highlight generation status
  */
-export function getHighlightStatus(req, res) {
+export async function getHighlightStatus(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const highlight = db.prepare(`
-      SELECT status, created_at
-      FROM highlights
-      WHERE video_id = ?
-    `).get(id);
+        const highlight = await db.get(`
+            SELECT status, created_at
+            FROM highlights
+            WHERE video_id = $1
+        `, [id]);
 
         if (!highlight) {
             return res.status(404).json({ success: false, error: 'No highlights found' });

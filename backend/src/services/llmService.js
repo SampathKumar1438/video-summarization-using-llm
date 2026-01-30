@@ -3,7 +3,9 @@ import { extractJSON, formatTime } from '../utils/helpers.js';
 
 // Default to Ollama, but support generic OpenAI-compatible endpoints
 const LLM_BASE_URL = process.env.LLM_SERVICE_URL || 'http://localhost:11434/v1';
-const LLM_MODEL = process.env.LLM_MODEL || 'tinyllama';
+const LLM_MODEL = process.env.LLM_MODEL || 'llama3.2';
+
+console.log(`LLM Service configured: ${LLM_BASE_URL} with model ${LLM_MODEL}`);
 
 /**
  * Generate completion from LLM using Chat API
@@ -43,27 +45,27 @@ async function generateCompletion(messages, maxTokens = 4096) {
  * @param {number} duration
  */
 export async function analyzeVideo(segments, duration) {
-    // 1. Prepare Transcript
+    // 1. Prepare Transcript with timestamps
     const transcriptText = segments
-        .map(s => `[${Math.floor(s.start_time)}] ${s.text}`)
+        .map(s => `[${Math.floor(s.start_time)}s] ${s.text}`)
         .join('\n')
         .substring(0, 15000); // Token limit safety
 
-    // 2. Construct Master Prompt
-    const systemPrompt = `You are an expert video analyst.
+    // 2. Construct Enhanced Master Prompt
+    const systemPrompt = `You are an expert video analyst specializing in content curation and highlight detection.
 Your task is to analyze the provided transcript and generate a structured JSON report.
 You must return VALID JSON only. Do not use Markdown. Do not add explanations.
 
 Required Schema:
 {
   "summary": {
-    "full": "2-3 paragraph detailed summary",
-    "brief": "One sentence hook"
+    "full": "2-3 paragraph detailed summary covering main topics, key points, and conclusions",
+    "brief": "One engaging sentence that captures the essence of the video"
   },
   "chapters": [
     {
-      "title": "Chapter Title",
-      "summary": "Brief description",
+      "title": "Descriptive Chapter Title",
+      "summary": "Brief description of what happens in this chapter",
       "start_time": 0,
       "end_time": 120
     }
@@ -72,8 +74,9 @@ Required Schema:
     {
       "start_time": 10,
       "end_time": 40,
-      "reason": "Why this is interesting",
-      "duration": 30
+      "category": "insight|emotional|action|quotable|turning_point",
+      "reason": "Specific explanation of why this moment is highlight-worthy",
+      "transcript_excerpt": "The exact words spoken during this highlight"
     }
   ],
   "search_index": [
@@ -81,18 +84,38 @@ Required Schema:
   ]
 }`;
 
-    const userPrompt = `Analyze this video transcript (Duration: ${duration}s).
+    const userPrompt = `Analyze this video transcript (Total Duration: ${Math.floor(duration)} seconds).
 
-Constraints:
-1. **Chapters**: Generate 4-8 logical chapters covering the whole video. Use numeric timestamps (seconds).
-2. **Highlights**: specific funny/interesting/important moments.
-   - EXACTLY 3 clips.
-   - Each clip MUST be 15-60 seconds long.
-   - start_time MUST be < end_time.
-3. **Search Index**: 10-15 keywords/concepts for finding this video.
+## CHAPTER REQUIREMENTS:
+- Generate 4-8 logical chapters that cover the ENTIRE video from start to end
+- Each chapter should represent a distinct topic or segment
+- Use numeric timestamps (in seconds) that match the transcript
+- Chapters must be sequential with no gaps: first chapter starts at 0, last ends at ${Math.floor(duration)}
 
-Transcript:
-${transcriptText}`;
+## HIGHLIGHT REQUIREMENTS (VERY IMPORTANT):
+Identify the TOP 3 most compelling moments based on these criteria:
+
+1. **EMOTIONAL PEAKS**: Moments of excitement, surprise, laughter, tension, or strong reactions
+2. **KEY INSIGHTS**: Important revelations, conclusions, "aha" moments, expert opinions
+3. **ACTION/VISUAL INTEREST**: Demonstrations, reveals, transformations, before/after moments
+4. **QUOTABLE MOMENTS**: Memorable statements, jokes, catchphrases, powerful quotes
+5. **NARRATIVE TURNING POINTS**: Plot twists, topic transitions, climaxes, unexpected changes
+
+For each highlight:
+- start_time: The EXACT second from the transcript where the moment begins
+- end_time: Include 2-3 seconds AFTER the moment ends for context (duration: 15-60 seconds)
+- category: Choose from [insight, emotional, action, quotable, turning_point]
+- reason: Explain WHY this specific moment deserves to be highlighted
+- transcript_excerpt: Copy the ACTUAL WORDS spoken during this highlight from the transcript
+
+## SEARCH INDEX:
+- 10-15 keywords/concepts that would help someone find this video
+- Include proper nouns, technical terms, and topic keywords
+
+## TRANSCRIPT:
+${transcriptText}
+
+Remember: Return ONLY valid JSON, no markdown formatting.`;
 
     // 3. Call LLM
     try {
@@ -136,45 +159,72 @@ function normalizeAnalysis(data, duration, segments) {
         search_index: Array.isArray(data.search_index) ? data.search_index : []
     };
 
-    // Fix Highlights
+    // Fix Highlights with enhanced validation
     result.highlights = result.highlights
         .map(h => {
             // Ensure numeric
             h.start_time = parseFloat(h.start_time) || 0;
             h.end_time = parseFloat(h.end_time) || 0;
 
+            // Clamp to video duration
+            h.start_time = Math.max(0, Math.min(h.start_time, duration - 15));
+            h.end_time = Math.min(h.end_time, duration);
+
             // Logic checks
             if (h.end_time <= h.start_time) h.end_time = h.start_time + 30; // Force 30s
+
             let dur = h.end_time - h.start_time;
 
-            // Clamp constraints (15s - 60s)
-            if (dur < 15) { h.end_time = h.start_time + 15; }
+            // Clamp duration constraints (15s - 60s)
+            if (dur < 15) { h.end_time = Math.min(h.start_time + 15, duration); }
             if (dur > 60) { h.end_time = h.start_time + 60; }
 
             h.duration = h.end_time - h.start_time;
+
+            // Validate category
+            const validCategories = ['insight', 'emotional', 'action', 'quotable', 'turning_point', 'general'];
+            if (!validCategories.includes(h.category)) {
+                h.category = 'general';
+            }
+
+            // Find transcript excerpt if not provided
+            if (!h.transcript_excerpt) {
+                const relevantSegments = segments.filter(
+                    s => s.start_time >= h.start_time && s.end_time <= h.end_time
+                );
+                h.transcript_excerpt = relevantSegments.map(s => s.text).join(' ').substring(0, 200);
+            }
+
             return h;
         })
+        .filter(h => h.duration >= 10) // Remove clips shorter than 10s
         .slice(0, 3); // Enforce limit
 
     // Ensure at least one highlight if segments exist
     if (result.highlights.length === 0 && segments.length > 0) {
-        const firstSeg = segments[0];
+        // Find the segment with the most text (likely most content-rich)
+        const richestSegment = segments.reduce((best, seg) =>
+            seg.text.length > best.text.length ? seg : best
+            , segments[0]);
+
         result.highlights.push({
-            start_time: firstSeg.start_time,
-            end_time: Math.min(firstSeg.start_time + 30, duration),
-            reason: "Auto-generated intro highlight",
+            start_time: Math.max(0, richestSegment.start_time - 2),
+            end_time: Math.min(richestSegment.end_time + 28, duration),
+            category: 'general',
+            reason: "Auto-selected content-rich segment",
+            transcript_excerpt: richestSegment.text.substring(0, 200),
             duration: 30
         });
     }
 
     // Fix Chapters (ensure coverage)
     if (result.chapters.length === 0) {
-        result.chapters.push({
-            title: "Full Video",
-            summary: "Complete recording",
-            start_time: 0,
-            end_time: duration
-        });
+        result.chapters = generateHeuristicChapters(segments, duration);
+    } else {
+        // Ensure chapters cover the full duration
+        result.chapters.sort((a, b) => a.start_time - b.start_time);
+        result.chapters[0].start_time = 0;
+        result.chapters[result.chapters.length - 1].end_time = duration;
     }
 
     return result;
@@ -186,18 +236,26 @@ function normalizeAnalysis(data, duration, segments) {
 function generateFallbackAnalysis(segments, duration) {
     const fullText = segments.map(s => s.text).join(' ');
 
+    // Find interesting segments based on text length and position
+    const highlightCandidates = segments
+        .map((s, idx) => ({ ...s, score: s.text.length + (idx < 3 ? 50 : 0) + (idx > segments.length - 3 ? 30 : 0) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
+
     return {
         summary: {
             full: fullText.substring(0, 500) + "...",
             brief: "Automated transcript processing."
         },
         chapters: generateHeuristicChapters(segments, duration),
-        highlights: [{
-            start_time: 0,
-            end_time: Math.min(30, duration),
-            reason: "Preview Clip",
-            duration: Math.min(30, duration)
-        }],
+        highlights: highlightCandidates.map((seg, idx) => ({
+            start_time: Math.max(0, seg.start_time - 2),
+            end_time: Math.min(seg.end_time + 28, duration),
+            category: idx === 0 ? 'insight' : 'general',
+            reason: idx === 0 ? "Opening segment" : "Content-rich segment",
+            transcript_excerpt: seg.text.substring(0, 200),
+            duration: Math.min(30, seg.end_time - seg.start_time + 30)
+        })),
         search_index: ["video", "auto-generated"]
     };
 }

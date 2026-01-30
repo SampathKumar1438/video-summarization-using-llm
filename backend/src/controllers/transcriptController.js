@@ -3,23 +3,23 @@ import { getDatabase } from '../config/database.js';
 /**
  * Get full transcript for a video
  */
-export function getTranscript(req, res) {
+export async function getTranscript(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
         // Verify video exists
-        const video = db.prepare('SELECT id, original_name FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT id, original_name FROM videos WHERE id = $1', [id]);
         if (!video) {
             return res.status(404).json({ success: false, error: 'Video not found' });
         }
 
-        const segments = db.prepare(`
-      SELECT id, segment_index, start_time, end_time, text, confidence
-      FROM transcripts
-      WHERE video_id = ?
-      ORDER BY segment_index
-    `).all(id);
+        const segments = await db.all(`
+            SELECT id, segment_index, start_time, end_time, text, confidence
+            FROM transcripts
+            WHERE video_id = $1
+            ORDER BY segment_index
+        `, [id]);
 
         const fullText = segments.map(s => s.text).join(' ');
 
@@ -49,7 +49,7 @@ export function getTranscript(req, res) {
 /**
  * Get transcript segment at specific timestamp
  */
-export function getTranscriptAtTime(req, res) {
+export async function getTranscriptAtTime(req, res) {
     try {
         const { id } = req.params;
         const { time } = req.query;
@@ -61,23 +61,23 @@ export function getTranscriptAtTime(req, res) {
         const timestamp = parseFloat(time);
         const db = getDatabase();
 
-        const segment = db.prepare(`
-      SELECT id, segment_index, start_time, end_time, text
-      FROM transcripts
-      WHERE video_id = ? AND start_time <= ? AND end_time >= ?
-      ORDER BY start_time
-      LIMIT 1
-    `).get(id, timestamp, timestamp);
+        const segment = await db.get(`
+            SELECT id, segment_index, start_time, end_time, text
+            FROM transcripts
+            WHERE video_id = $1 AND start_time <= $2 AND end_time >= $2
+            ORDER BY start_time
+            LIMIT 1
+        `, [id, timestamp]);
 
         if (!segment) {
             // Get nearest segment
-            const nearest = db.prepare(`
-        SELECT id, segment_index, start_time, end_time, text
-        FROM transcripts
-        WHERE video_id = ?
-        ORDER BY ABS(start_time - ?)
-        LIMIT 1
-      `).get(id, timestamp);
+            const nearest = await db.get(`
+                SELECT id, segment_index, start_time, end_time, text
+                FROM transcripts
+                WHERE video_id = $1
+                ORDER BY ABS(start_time - $2)
+                LIMIT 1
+            `, [id, timestamp]);
 
             if (!nearest) {
                 return res.status(404).json({ success: false, error: 'No transcript found' });
@@ -112,16 +112,16 @@ export function getTranscriptAtTime(req, res) {
 /**
  * Get video summary
  */
-export function getSummary(req, res) {
+export async function getSummary(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const summary = db.prepare(`
-      SELECT full_summary, brief_summary, created_at
-      FROM summaries
-      WHERE video_id = ?
-    `).get(id);
+        const summary = await db.get(`
+            SELECT full_summary, brief_summary, created_at
+            FROM summaries
+            WHERE video_id = $1
+        `, [id]);
 
         if (!summary) {
             return res.status(404).json({ success: false, error: 'Summary not found' });
@@ -145,17 +145,17 @@ export function getSummary(req, res) {
 /**
  * Get key notes
  */
-export function getNotes(req, res) {
+export async function getNotes(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const notes = db.prepare(`
-      SELECT id, note_index, content, start_time, end_time
-      FROM notes
-      WHERE video_id = ?
-      ORDER BY note_index
-    `).all(id);
+        const notes = await db.all(`
+            SELECT id, note_index, content, start_time, end_time
+            FROM notes
+            WHERE video_id = $1
+            ORDER BY note_index
+        `, [id]);
 
         res.json({
             success: true,
@@ -180,17 +180,17 @@ export function getNotes(req, res) {
 /**
  * Get action items / todos
  */
-export function getTodos(req, res) {
+export async function getTodos(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const todos = db.prepare(`
-      SELECT id, todo_index, content, priority, completed, start_time
-      FROM todos
-      WHERE video_id = ?
-      ORDER BY todo_index
-    `).all(id);
+        const todos = await db.all(`
+            SELECT id, todo_index, content, priority, completed, start_time
+            FROM todos
+            WHERE video_id = $1
+            ORDER BY todo_index
+        `, [id]);
 
         res.json({
             success: true,
@@ -216,25 +216,25 @@ export function getTodos(req, res) {
 /**
  * Toggle todo completion
  */
-export function toggleTodo(req, res) {
+export async function toggleTodo(req, res) {
     try {
         const { id, todoId } = req.params;
         const db = getDatabase();
 
-        const todo = db.prepare('SELECT * FROM todos WHERE id = ? AND video_id = ?').get(todoId, id);
+        const todo = await db.get('SELECT * FROM todos WHERE id = $1 AND video_id = $2', [todoId, id]);
 
         if (!todo) {
             return res.status(404).json({ success: false, error: 'Todo not found' });
         }
 
-        const newCompleted = todo.completed ? 0 : 1;
-        db.prepare('UPDATE todos SET completed = ? WHERE id = ?').run(newCompleted, todoId);
+        const newCompleted = !todo.completed;
+        await db.run('UPDATE todos SET completed = $1 WHERE id = $2', [newCompleted, todoId]);
 
         res.json({
             success: true,
             data: {
                 id: parseInt(todoId),
-                completed: Boolean(newCompleted)
+                completed: newCompleted
             }
         });
     } catch (error) {
@@ -246,17 +246,17 @@ export function toggleTodo(req, res) {
 /**
  * Get chapters
  */
-export function getChapters(req, res) {
+export async function getChapters(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const chapters = db.prepare(`
-      SELECT id, chapter_index, title, summary, start_time, end_time
-      FROM chapters
-      WHERE video_id = ?
-      ORDER BY chapter_index
-    `).all(id);
+        const chapters = await db.all(`
+            SELECT id, chapter_index, title, summary, start_time, end_time
+            FROM chapters
+            WHERE video_id = $1
+            ORDER BY chapter_index
+        `, [id]);
 
         res.json({
             success: true,

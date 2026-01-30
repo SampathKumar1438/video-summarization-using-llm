@@ -1,4 +1,4 @@
-import initSqlJs from 'sql.js';
+import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -6,228 +6,199 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATABASE_PATH = process.env.DATABASE_PATH || path.join(__dirname, '../../storage/database.sqlite');
+// Database connection configuration
+// Support both individual env vars and DATABASE_URL
+const dbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5433'),
+    database: process.env.DB_NAME || 'checkmate',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'acheron#132',
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+};
+
+const pool = new pg.Pool(dbConfig);
+
+// Handle pool errors
+pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+});
+
+/**
+ * Database wrapper class to provide a consistent API
+ * Similar interface to previous sql.js implementation but async
+ */
+class Database {
+    constructor(pool) {
+        this.pool = pool;
+    }
+
+    /**
+     * Execute a query with parameters
+     * @param {string} sql - SQL query with $1, $2, etc. placeholders
+     * @param {Array} params - Query parameters
+     * @returns {Promise<{rows: Array, rowCount: number}>}
+     */
+    async query(sql, params = []) {
+        const client = await this.pool.connect();
+        try {
+            const result = await client.query(sql, params);
+            return result;
+        } finally {
+            client.release();
+        }
+    }
+
+    /**
+     * Get a single row
+     * @param {string} sql - SQL query
+     * @param {Array} params - Query parameters
+     * @returns {Promise<Object|undefined>}
+     */
+    async get(sql, params = []) {
+        const result = await this.query(sql, params);
+        return result.rows[0];
+    }
+
+    /**
+     * Get all matching rows
+     * @param {string} sql - SQL query
+     * @param {Array} params - Query parameters
+     * @returns {Promise<Array>}
+     */
+    async all(sql, params = []) {
+        const result = await this.query(sql, params);
+        return result.rows;
+    }
+
+    /**
+     * Execute an insert/update/delete and return affected info
+     * @param {string} sql - SQL query
+     * @param {Array} params - Query parameters
+     * @returns {Promise<{lastInsertRowid: number, changes: number}>}
+     */
+    async run(sql, params = []) {
+        // For INSERT queries, append RETURNING id to get lastInsertRowid
+        let modifiedSql = sql;
+        const isInsert = sql.trim().toUpperCase().startsWith('INSERT');
+
+        if (isInsert && !sql.toUpperCase().includes('RETURNING')) {
+            modifiedSql = sql.replace(/;?\s*$/, ' RETURNING id');
+        }
+
+        const result = await this.query(modifiedSql, params);
+
+        return {
+            lastInsertRowid: result.rows[0]?.id || 0,
+            changes: result.rowCount
+        };
+    }
+
+    /**
+     * Execute raw SQL (for schema creation, etc.)
+     * @param {string} sql - SQL statements
+     */
+    async exec(sql) {
+        const client = await this.pool.connect();
+        try {
+            await client.query(sql);
+        } finally {
+            client.release();
+        }
+    }
+
+    /**
+     * Begin a transaction
+     * @returns {Promise<pg.PoolClient>}
+     */
+    async beginTransaction() {
+        const client = await this.pool.connect();
+        await client.query('BEGIN');
+        return client;
+    }
+
+    /**
+     * Commit a transaction
+     * @param {pg.PoolClient} client
+     */
+    async commitTransaction(client) {
+        await client.query('COMMIT');
+        client.release();
+    }
+
+    /**
+     * Rollback a transaction
+     * @param {pg.PoolClient} client
+     */
+    async rollbackTransaction(client) {
+        await client.query('ROLLBACK');
+        client.release();
+    }
+
+    /**
+     * Close the pool
+     */
+    async close() {
+        await this.pool.end();
+    }
+}
 
 let db = null;
-let SQL = null;
-
-/**
- * Wrapper class to provide better-sqlite3 compatible API for sql.js
- */
-class PreparedStatement {
-  constructor(db, sql) {
-    this.db = db;
-    this.sql = sql;
-  }
-
-  run(...params) {
-    try {
-      this.db.run(this.sql, params);
-      // sql.js doesn't have lastInsertRowid on run, we need to query it
-      const result = this.db.exec('SELECT last_insert_rowid() as id');
-      const lastInsertRowid = result.length > 0 ? result[0].values[0][0] : 0;
-      const changes = this.db.getRowsModified();
-      saveDatabase(); // Auto-save after modification
-      return { lastInsertRowid, changes };
-    } catch (error) {
-      console.error('SQL run error:', error.message, 'SQL:', this.sql);
-      throw error;
-    }
-  }
-
-  get(...params) {
-    try {
-      const stmt = this.db.prepare(this.sql);
-      stmt.bind(params);
-      if (stmt.step()) {
-        const columns = stmt.getColumnNames();
-        const values = stmt.get();
-        stmt.free();
-        const row = {};
-        columns.forEach((col, i) => {
-          row[col] = values[i];
-        });
-        return row;
-      }
-      stmt.free();
-      return undefined;
-    } catch (error) {
-      console.error('SQL get error:', error.message, 'SQL:', this.sql);
-      throw error;
-    }
-  }
-
-  all(...params) {
-    try {
-      const stmt = this.db.prepare(this.sql);
-      stmt.bind(params);
-      const results = [];
-      const columns = stmt.getColumnNames();
-      while (stmt.step()) {
-        const values = stmt.get();
-        const row = {};
-        columns.forEach((col, i) => {
-          row[col] = values[i];
-        });
-        results.push(row);
-      }
-      stmt.free();
-      return results;
-    } catch (error) {
-      console.error('SQL all error:', error.message, 'SQL:', this.sql);
-      throw error;
-    }
-  }
-}
-
-/**
- * Database wrapper to provide better-sqlite3 compatible API
- */
-class DatabaseWrapper {
-  constructor(sqlDb) {
-    this.sqlDb = sqlDb;
-    this.inTransaction = false;
-  }
-
-  prepare(sql) {
-    return new PreparedStatement(this.sqlDb, sql);
-  }
-
-  exec(sql) {
-    this.sqlDb.exec(sql);
-    if (!this.inTransaction) {
-      saveDatabase();
-    }
-  }
-
-  pragma(statement) {
-    // sql.js handles pragmas differently, just execute it
-    try {
-      this.sqlDb.exec(`PRAGMA ${statement}`);
-    } catch (e) {
-      // Ignore pragma errors as some may not apply
-    }
-  }
-
-  transaction(fn) {
-    return (...args) => {
-      this.sqlDb.exec('BEGIN TRANSACTION');
-      this.inTransaction = true;
-      try {
-        const result = fn(...args);
-        this.sqlDb.exec('COMMIT');
-        this.inTransaction = false;
-        saveDatabase();
-        return result;
-      } catch (error) {
-        console.error('Transaction failed:', error);
-        try {
-          this.sqlDb.exec('ROLLBACK');
-        } catch (rollbackError) {
-          console.error('Rollback failed:', rollbackError);
-        }
-        this.inTransaction = false; // Always reset
-        throw error;
-      }
-    };
-  }
-
-  close() {
-    saveDatabase();
-    this.sqlDb.close();
-  }
-}
-
-/**
- * Save database to file
- */
-function saveDatabase() {
-  if (db && db.sqlDb) {
-    // Don't save if in transaction
-    if (db.inTransaction) return;
-
-    try {
-      const data = db.sqlDb.export();
-      const buffer = Buffer.from(data);
-      fs.writeFileSync(DATABASE_PATH, buffer);
-    } catch (error) {
-      console.error('Error saving database:', error.message);
-    }
-  }
-}
 
 /**
  * Initialize the database connection and create tables
  */
 export async function initDatabase() {
-  // Ensure the storage directory exists
-  const storageDir = path.dirname(DATABASE_PATH);
-  if (!fs.existsSync(storageDir)) {
-    fs.mkdirSync(storageDir, { recursive: true });
-  }
-
-  // Initialize SQL.js
-  if (!SQL) {
-    SQL = await initSqlJs();
-  }
-
-  // Load existing database or create new one
-  let sqlDb;
-  if (fs.existsSync(DATABASE_PATH)) {
-    const fileBuffer = fs.readFileSync(DATABASE_PATH);
-    sqlDb = new SQL.Database(fileBuffer);
-  } else {
-    sqlDb = new SQL.Database();
-  }
-
-  // Create wrapper
-  db = new DatabaseWrapper(sqlDb);
-
-  // Enable foreign keys
-  db.pragma('foreign_keys = ON');
-
-  // Read and execute schema
-  const schemaPath = path.join(__dirname, '../models/schema.sql');
-  const schema = fs.readFileSync(schemaPath, 'utf-8');
-
-  // Split by semicolons and execute each statement
-  const statements = schema.split(';').filter(s => s.trim());
-  for (const statement of statements) {
     try {
-      db.sqlDb.exec(statement);
+        // Create database wrapper
+        db = new Database(pool);
+
+        // Test connection
+        await db.query('SELECT NOW()');
+        console.log('PostgreSQL connection established');
+
+        // Read and execute schema
+        const schemaPath = path.join(__dirname, '../models/schema_postgres.sql');
+
+        if (fs.existsSync(schemaPath)) {
+            const schema = fs.readFileSync(schemaPath, 'utf-8');
+
+            // Execute schema (PostgreSQL handles IF NOT EXISTS properly)
+            await db.exec(schema);
+            console.log('Database schema initialized');
+        } else {
+            console.warn('Schema file not found:', schemaPath);
+        }
+
+        console.log('Database initialized successfully');
+        return db;
     } catch (error) {
-      // Ignore "already exists" errors for IF NOT EXISTS statements
-      if (!error.message.includes('already exists')) {
-        console.error('Error executing statement:', error.message);
-      }
+        console.error('Database initialization error:', error.message);
+        throw error;
     }
-  }
-
-  // Save initial database state
-  saveDatabase();
-
-  console.log('Database initialized successfully');
-  return db;
 }
 
 /**
  * Get the database instance
+ * @returns {Database}
  */
 export function getDatabase() {
-  if (!db) {
-    throw new Error('Database not initialized. Call initDatabase() first.');
-  }
-  return db;
+    if (!db) {
+        throw new Error('Database not initialized. Call initDatabase() first.');
+    }
+    return db;
 }
 
 /**
  * Close the database connection
  */
-export function closeDatabase() {
-  if (db) {
-    db.close();
-    db = null;
-  }
+export async function closeDatabase() {
+    if (db) {
+        await db.close();
+        db = null;
+    }
 }
 
 export default { initDatabase, getDatabase, closeDatabase };

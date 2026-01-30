@@ -17,6 +17,34 @@ export async function uploadVideo(req, res) {
 
         const db = getDatabase();
         const originalName = req.file.originalname;
+        const fileSize = req.file.size;
+
+        // Check for duplicate (same name and size)
+        const existing = await db.get(
+            `SELECT id, status FROM videos 
+             WHERE original_name = $1 AND file_size = $2 
+             ORDER BY created_at DESC LIMIT 1`,
+            [originalName, fileSize]
+        );
+
+        if (existing) {
+            // Delete uploaded temp file
+            if (fs.existsSync(req.file.path)) {
+                fs.unlinkSync(req.file.path);
+            }
+
+            return res.status(200).json({
+                success: true,
+                data: {
+                    id: existing.id,
+                    originalName,
+                    status: existing.status,
+                    message: 'Video already exists, returning existing record',
+                    isDuplicate: true
+                }
+            });
+        }
+
         const filename = generateFilename(originalName);
         const filePath = path.join(VIDEO_STORAGE_PATH, filename);
 
@@ -29,10 +57,11 @@ export async function uploadVideo(req, res) {
         fs.renameSync(req.file.path, filePath);
 
         // Insert into database
-        const result = db.prepare(`
-      INSERT INTO videos (filename, original_name, file_path, file_size, status)
-      VALUES (?, ?, ?, ?, 'uploaded')
-    `).run(filename, originalName, filePath, req.file.size);
+        const result = await db.run(
+            `INSERT INTO videos (filename, original_name, file_path, file_size, status)
+             VALUES ($1, $2, $3, $4, 'uploaded')`,
+            [filename, originalName, filePath, fileSize]
+        );
 
         const videoId = result.lastInsertRowid;
 
@@ -58,14 +87,14 @@ export async function uploadVideo(req, res) {
 /**
  * Get all videos
  */
-export function getAllVideos(req, res) {
+export async function getAllVideos(req, res) {
     try {
         const db = getDatabase();
-        const videos = db.prepare(`
-      SELECT id, filename, original_name, duration_seconds, file_size, status, created_at, updated_at
-      FROM videos
-      ORDER BY created_at DESC
-    `).all();
+        const videos = await db.all(`
+            SELECT id, filename, original_name, duration_seconds, file_size, status, created_at, updated_at
+            FROM videos
+            ORDER BY created_at DESC
+        `);
 
         res.json({
             success: true,
@@ -89,24 +118,24 @@ export function getAllVideos(req, res) {
 /**
  * Get single video details
  */
-export function getVideo(req, res) {
+export async function getVideo(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT * FROM videos WHERE id = $1', [id]);
 
         if (!video) {
             return res.status(404).json({ success: false, error: 'Video not found' });
         }
 
         // Check what data is available
-        const hasTranscript = db.prepare('SELECT COUNT(*) as count FROM transcripts WHERE video_id = ?').get(id).count > 0;
-        const hasSummary = db.prepare('SELECT COUNT(*) as count FROM summaries WHERE video_id = ?').get(id).count > 0;
-        const hasChapters = db.prepare('SELECT COUNT(*) as count FROM chapters WHERE video_id = ?').get(id).count > 0;
-        const hasNotes = db.prepare('SELECT COUNT(*) as count FROM notes WHERE video_id = ?').get(id).count > 0;
-        const hasTodos = db.prepare('SELECT COUNT(*) as count FROM todos WHERE video_id = ?').get(id).count > 0;
-        const highlight = db.prepare('SELECT * FROM highlights WHERE video_id = ?').get(id);
+        const transcriptCount = await db.get('SELECT COUNT(*) as count FROM transcripts WHERE video_id = $1', [id]);
+        const summaryCount = await db.get('SELECT COUNT(*) as count FROM summaries WHERE video_id = $1', [id]);
+        const chapterCount = await db.get('SELECT COUNT(*) as count FROM chapters WHERE video_id = $1', [id]);
+        const noteCount = await db.get('SELECT COUNT(*) as count FROM notes WHERE video_id = $1', [id]);
+        const todoCount = await db.get('SELECT COUNT(*) as count FROM todos WHERE video_id = $1', [id]);
+        const highlight = await db.get('SELECT * FROM highlights WHERE video_id = $1', [id]);
 
         res.json({
             success: true,
@@ -120,11 +149,11 @@ export function getVideo(req, res) {
                 errorMessage: video.error_message,
                 createdAt: video.created_at,
                 updatedAt: video.updated_at,
-                hasTranscript,
-                hasSummary,
-                hasChapters,
-                hasNotes,
-                hasTodos,
+                hasTranscript: parseInt(transcriptCount.count) > 0,
+                hasSummary: parseInt(summaryCount.count) > 0,
+                hasChapters: parseInt(chapterCount.count) > 0,
+                hasNotes: parseInt(noteCount.count) > 0,
+                hasTodos: parseInt(todoCount.count) > 0,
                 hasHighlights: highlight?.status === 'completed'
             }
         });
@@ -137,12 +166,12 @@ export function getVideo(req, res) {
 /**
  * Get video processing status
  */
-export function getVideoStatus(req, res) {
+export async function getVideoStatus(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const video = db.prepare('SELECT id, status, error_message, updated_at FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT id, status, error_message, updated_at FROM videos WHERE id = $1', [id]);
 
         if (!video) {
             return res.status(404).json({ success: false, error: 'Video not found' });
@@ -170,12 +199,12 @@ export function getVideoStatus(req, res) {
 /**
  * Stream video file
  */
-export function streamVideo(req, res) {
+export async function streamVideo(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const video = db.prepare('SELECT file_path FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT file_path FROM videos WHERE id = $1', [id]);
 
         if (!video || !fs.existsSync(video.file_path)) {
             return res.status(404).json({ success: false, error: 'Video not found' });
@@ -216,12 +245,12 @@ export function streamVideo(req, res) {
 /**
  * Delete a video
  */
-export function deleteVideo(req, res) {
+export async function deleteVideo(req, res) {
     try {
         const { id } = req.params;
         const db = getDatabase();
 
-        const video = db.prepare('SELECT file_path FROM videos WHERE id = ?').get(id);
+        const video = await db.get('SELECT file_path FROM videos WHERE id = $1', [id]);
 
         if (!video) {
             return res.status(404).json({ success: false, error: 'Video not found' });
@@ -233,7 +262,7 @@ export function deleteVideo(req, res) {
         }
 
         // Delete from database (cascade will handle related records)
-        db.prepare('DELETE FROM videos WHERE id = ?').run(id);
+        await db.run('DELETE FROM videos WHERE id = $1', [id]);
 
         res.json({ success: true, message: 'Video deleted successfully' });
     } catch (error) {
